@@ -1,0 +1,52 @@
+# v0 runtime files (should only exist in preview, not in git)
+__v0_runtime_loader.js
+__v0_devtools.tsx
+__v0_jsx-dev-runtime.ts
+
+# Common ignores
+node_modules/
+.next/
+.env*.local
+.DS_Store
+
+# Node
+node_modules
+.next
+out
+dist
+build
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Chrome / playwright / puppeteer basura
+.chrome*
+BrowserMetrics*
+Crashpad*
+Default
+Cache
+Code Cache
+GPUCache
+*.pma
+*.ldb
+*.log.old
+*.journal
+LOCK
+
+# IDE
+.vscode/*
+!.vscode/settings.json
+
+# misc
+tmp
+temp
