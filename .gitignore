@@ -1,52 +1,94 @@
-# v0 runtime files (should only exist in preview, not in git)
-__v0_runtime_loader.js
-__v0_devtools.tsx
-__v0_jsx-dev-runtime.ts
-
-# Common ignores
+########################################
+# Node / Next
+########################################
 node_modules/
 .next/
-.env*.local
-.DS_Store
+out/
+dist/
+build/
+coverage/
+*.tsbuildinfo
 
-# Node
-node_modules
-.next
-out
-dist
-build
-
-# Env
+########################################
+# Environment (credenciales)
+########################################
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 
+########################################
 # Logs
+########################################
+logs/
 *.log
-logs
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
+########################################
 # OS
+########################################
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# Chrome / playwright / puppeteer basura
+########################################
+# IDE
+########################################
+.vscode/*
+!.vscode/settings.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+########################################
+# Browser automation / sesiones
+########################################
 .chrome*
+Default/
+Cache/
+Code Cache/
+GPUCache/
+Crashpad/
 BrowserMetrics*
-Crashpad*
-Default
-Cache
-Code Cache
-GPUCache
-*.pma
+playwright-report/
+test-results/
+*.har
 *.ldb
-*.log.old
+*.pma
 *.journal
 LOCK
 
-# IDE
-.vscode/*
-!.vscode/settings.json
+########################################
+# Build artifacts / descargas
+########################################
+*.tgz
+*.zip
+*.7z
+*.rar
+*.exe
+*.msi
+*.bin
+*.apk
+*.deb
+*.rpm
 
-# misc
-tmp
-temp
+########################################
+# Archivos generados por scripts
+########################################
+my-project*
+npx
+next
+[0-9]*.[0-9]*.[0-9]*
+
+########################################
+# Datos locales
+########################################
+.data/
+tmp/
+temp/
+downloads/
+uploads/
