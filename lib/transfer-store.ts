@@ -1,11 +1,13 @@
 import fs from "fs"
 import path from "path"
-import type { TransferBatch, TransferEntry } from "./transfer-types"
+import type { TransferBatch, TransferEntry, TransferOperationLog } from "./transfer-types"
 
 const DATA_DIR = path.join(process.cwd(), ".data")
 const STORE_FILE = path.join(DATA_DIR, "transfer-batches.json")
+const LOG_FILE = path.join(DATA_DIR, "transfer-operations-log.json")
 
 let batches: TransferBatch[] = loadFromDisk()
+let operationLogs: TransferOperationLog[] = loadLogsFromDisk()
 
 function loadFromDisk(): TransferBatch[] {
   try {
@@ -18,12 +20,34 @@ function loadFromDisk(): TransferBatch[] {
   }
 }
 
+function loadLogsFromDisk(): TransferOperationLog[] {
+  try {
+    if (!fs.existsSync(LOG_FILE)) return []
+    const raw = fs.readFileSync(LOG_FILE, "utf-8")
+    const parsed = JSON.parse(raw) as TransferOperationLog[]
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    return []
+  }
+}
+
 function saveToDisk(next: TransferBatch[]) {
   try {
     if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true })
     const tmp = STORE_FILE + ".tmp"
     fs.writeFileSync(tmp, JSON.stringify(next, null, 2), "utf-8")
     fs.renameSync(tmp, STORE_FILE)
+  } catch {
+    // best-effort
+  }
+}
+
+function saveLogsToDisk(next: TransferOperationLog[]) {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true })
+    const tmp = LOG_FILE + ".tmp"
+    fs.writeFileSync(tmp, JSON.stringify(next, null, 2), "utf-8")
+    fs.renameSync(tmp, LOG_FILE)
   } catch {
     // best-effort
   }
@@ -79,4 +103,20 @@ export function deleteTransferBatch(id: string): boolean {
 
 export function clearAllTransferBatches(): void {
   setBatches([])
+}
+
+// --- Operation Log ---
+
+export function getTransferOperationLogs(): TransferOperationLog[] {
+  return operationLogs
+}
+
+export function addTransferOperationLog(log: TransferOperationLog): void {
+  operationLogs = [log, ...operationLogs]
+  saveLogsToDisk(operationLogs)
+}
+
+export function clearTransferOperationLogs(): void {
+  operationLogs = []
+  saveLogsToDisk(operationLogs)
 }

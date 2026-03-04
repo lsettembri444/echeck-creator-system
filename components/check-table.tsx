@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useState, useRef, useEffect } from "react"
 import {
   CheckCircle2,
   Clock,
@@ -74,6 +74,15 @@ export function CheckTable({
 }: CheckTableProps) {
   const [selectedChecks, setSelectedChecks] = useState<Set<string>>(new Set())
   const [showLogs, setShowLogs] = useState(false)
+  const logsEndRef = useRef<HTMLDivElement>(null)
+  const logsContainerRef = useRef<HTMLDivElement>(null)
+
+  // Auto-scroll to bottom when new logs arrive
+  useEffect(() => {
+    if (logsEndRef.current && logsContainerRef.current) {
+      logsEndRef.current.scrollIntoView({ behavior: "smooth", block: "end" })
+    }
+  }, [automationLogs])
 
   const pendingChecks = checks.filter((c) => c.status === "pending")
   const selectedPending = checks.filter(
@@ -158,32 +167,48 @@ export function CheckTable({
         </div>
       </div>
 
-      {/* Automation Logs Panel */}
-      {showLogs && automationLogs && automationLogs.length > 0 && (
-        <div className="rounded-lg border border-border bg-foreground/95 p-4 overflow-auto max-h-60">
+      {/* Automation Logs Panel -- show during sending or when logs exist and toggled */}
+      {(isSending || (showLogs && automationLogs && automationLogs.length > 0)) && (
+        <div
+          ref={logsContainerRef}
+          className="rounded-lg border border-border bg-foreground/95 p-4 overflow-auto max-h-72"
+        >
           <div className="flex items-center gap-2 mb-2">
             <Terminal className="h-4 w-4 text-success" />
             <span className="text-xs font-medium text-success font-mono">
               Registro de automatizacion
             </span>
+            {isSending && (
+              <Loader2 className="h-3 w-3 animate-spin text-success ml-auto" />
+            )}
           </div>
           <div className="flex flex-col gap-0.5">
-            {automationLogs.map((log, i) => (
+            {(!automationLogs || automationLogs.length === 0) && isSending && (
+              <span className="font-mono text-xs leading-5 text-background/50">
+                Iniciando automatizacion...
+              </span>
+            )}
+            {automationLogs?.map((log, i) => (
               <span
                 key={i}
                 className={cn(
                   "font-mono text-xs leading-5",
                   log.includes("ERROR")
                     ? "text-red-400"
-                    : log.includes("exitoso") || log.includes("agregado") || log.includes("finalizado")
-                      ? "text-green-400"
-                      : "text-background/80"
+                    : log.includes("[WARN]")
+                      ? "text-yellow-400"
+                      : log.includes("exitoso") || log.includes("agregado") || log.includes("finalizado") || log.includes("confirmada")
+                        ? "text-green-400"
+                        : log.startsWith("[debug]") || log.startsWith("  [debug]")
+                          ? "text-blue-300/70"
+                          : "text-background/80"
                 )}
               >
-                <span className="text-muted-foreground/50 mr-2 select-none">{String(i + 1).padStart(2, "0")}</span>
+                <span className="text-muted-foreground/50 mr-2 select-none">{String(i + 1).padStart(3, "0")}</span>
                 {log}
               </span>
             ))}
+            <div ref={logsEndRef} />
           </div>
         </div>
       )}

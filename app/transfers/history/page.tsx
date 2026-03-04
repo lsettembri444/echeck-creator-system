@@ -14,8 +14,9 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog"
-import { ArrowRightLeft, CheckCircle2, Clock, DollarSign } from "lucide-react"
-import type { TransferBatch, TransferEntry } from "@/lib/transfer-types"
+import { ArrowRightLeft, CheckCircle2, Clock, DollarSign, AlertCircle, FileText } from "lucide-react"
+import { cn } from "@/lib/utils"
+import type { TransferBatch, TransferEntry, TransferOperationLog } from "@/lib/transfer-types"
 
 const fetcher = (url: string) => fetch(url).then((r) => r.json())
 
@@ -27,6 +28,7 @@ const formatCurrency = (amount: number) =>
 
 export default function TransferHistoryPage() {
   const { data: batches = [], mutate } = useSWR<TransferBatch[]>("/api/transfers", fetcher)
+  const { data: operationLogs = [] } = useSWR<TransferOperationLog[]>("/api/transfers/history", fetcher)
 
   const resetHistory = async () => {
     const res = await fetch("/api/transfers/reset", { method: "POST" })
@@ -187,6 +189,102 @@ export default function TransferHistoryPage() {
             </div>
           ) : (
             <div className="flex flex-col gap-8">
+              {/* Executed Operations Log */}
+              {operationLogs.length > 0 && (
+                <div>
+                  <h2 className="text-sm font-semibold text-foreground mb-3">Operaciones ejecutadas</h2>
+                  <div className="flex flex-col gap-3">
+                    {operationLogs.map((op) => (
+                      <div
+                        key={op.id}
+                        className={cn(
+                          "rounded-lg border bg-card overflow-hidden",
+                          op.totalFailed > 0 ? "border-destructive/30" : "border-success/30"
+                        )}
+                      >
+                        <div
+                          className={cn(
+                            "flex items-center justify-between px-4 py-3 border-b",
+                            op.totalFailed > 0 ? "bg-destructive/5 border-destructive/20" : "bg-success/5 border-success/20"
+                          )}
+                        >
+                          <div className="flex items-center gap-3">
+                            <div
+                              className={cn(
+                                "flex h-8 w-8 items-center justify-center rounded-md",
+                                op.totalFailed > 0 ? "bg-destructive/10 text-destructive" : "bg-success/10 text-success"
+                              )}
+                            >
+                              <FileText className="h-4 w-4" />
+                            </div>
+                            <div>
+                              <div className="flex items-center gap-2">
+                                <span className="font-semibold text-foreground text-sm">
+                                  Fecha: {op.batchDate}
+                                </span>
+                                {op.bankOperationId && (
+                                  <span className="inline-flex items-center rounded-md bg-primary/10 border border-primary/20 px-2 py-0.5 text-xs font-mono font-medium text-primary">
+                                    ID: {op.bankOperationId}
+                                  </span>
+                                )}
+                              </div>
+                              <span className="text-xs text-muted-foreground">
+                                {formatDate(op.executedAt)} --{" "}
+                                {op.totalSent} enviada{op.totalSent !== 1 ? "s" : ""}
+                                {op.totalFailed > 0 && (
+                                  <span className="text-destructive">
+                                    , {op.totalFailed} con error
+                                  </span>
+                                )}
+                              </span>
+                            </div>
+                          </div>
+                          <span className="font-mono text-sm font-semibold text-foreground">
+                            {formatCurrency(op.totalAmount)}
+                          </span>
+                        </div>
+                        <div className="divide-y divide-border">
+                          {op.transfers.map((t, i) => (
+                            <div
+                              key={i}
+                              className={cn(
+                                "flex items-center gap-3 px-4 py-2",
+                                !t.success && "bg-destructive/5"
+                              )}
+                            >
+                              {t.success ? (
+                                <CheckCircle2 className="h-4 w-4 text-success shrink-0" />
+                              ) : (
+                                <AlertCircle className="h-4 w-4 text-destructive shrink-0" />
+                              )}
+                              <div className="flex-1 min-w-0">
+                                <span className="text-sm font-medium text-foreground">
+                                  {t.providerName}
+                                </span>
+                                <span className="text-xs text-muted-foreground ml-2 font-mono">
+                                  {t.cbu}
+                                </span>
+                              </div>
+                              <span className="font-mono text-sm font-medium text-foreground shrink-0">
+                                {formatCurrency(t.amount)}
+                              </span>
+                              <span
+                                className={cn(
+                                  "text-xs font-medium shrink-0",
+                                  t.success ? "text-success" : "text-destructive"
+                                )}
+                              >
+                                {t.success ? "Enviada" : t.error || "Error"}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               {/* Batches */}
               <div>
                 <h2 className="text-sm font-semibold text-foreground mb-3">Lotes</h2>

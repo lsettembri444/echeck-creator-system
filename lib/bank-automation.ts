@@ -49,14 +49,9 @@ export function normalizeDateToDDMMYYYY(input: string): string {
   // DD/MM/YYYY
   let m = s.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{4})$/)
   if (m) {
-    // Ambiguity guard (same as transfers API):
-    // If the middle number is > 12, it's likely MM/DD/YYYY.
-    const a = Number(m[1])
-    const b = Number(m[2])
+    const dd = m[1].padStart(2, "0")
+    const mm = m[2].padStart(2, "0")
     const yyyy = m[3]
-    const isUS = b > 12 && a >= 1 && a <= 12
-    const dd = String(isUS ? b : a).padStart(2, "0")
-    const mm = String(isUS ? a : b).padStart(2, "0")
     return `${dd}/${mm}/${yyyy}`
   }
   // YYYY-MM-DD
@@ -842,39 +837,64 @@ export async function clickPrepareAndAuthorize(page: Page, logs: string[]): Prom
 
   const tryInContext = async (ctx: Page | Frame, where: string) => {
     try {
-      const clicked = await (ctx as any).evaluate((reSrc) => {
+      const clicked = await (ctx as any).evaluate((reSrc: string) => {
         const re = new RegExp(reSrc, "i")
-        // Prefer explicit aria-label or button text
+
+        // 1) Prefer explicit <button> with matching text
         const buttons = Array.from(document.querySelectorAll('button')) as HTMLButtonElement[]
         for (const b of buttons) {
           const t = ((b.innerText || '') + ' ' + (b.getAttribute('aria-label') || '')).trim()
           if (re.test(t)) {
             b.scrollIntoView({ block: 'center', inline: 'center' })
             b.click()
-            return true
+            return { clicked: true, method: 'button', text: t }
           }
         }
-        // Fallback: span.button-wrap containing text -> closest button
-        const spans = Array.from(document.querySelectorAll('span')) as HTMLSpanElement[]
-        for (const s of spans) {
-          const t = (s.textContent || '').trim()
+
+        // 2) Fallback: <a> tags (bank sometimes uses anchor-styled buttons)
+        const anchors = Array.from(document.querySelectorAll('a')) as HTMLAnchorElement[]
+        for (const a of anchors) {
+          const t = (a.innerText || a.textContent || '').trim()
+          if (re.test(t)) {
+            a.scrollIntoView({ block: 'center', inline: 'center' })
+            a.click()
+            return { clicked: true, method: 'anchor', text: t }
+          }
+        }
+
+        // 3) Fallback: span/div containing text -> click the element or closest button/a
+        const els = Array.from(document.querySelectorAll('span, div, p')) as HTMLElement[]
+        for (const el of els) {
+          const t = (el.textContent || '').trim()
           if (!re.test(t)) continue
-          const btn = s.closest('button') as HTMLButtonElement | null
-          if (btn) {
-            btn.scrollIntoView({ block: 'center', inline: 'center' })
-            btn.click()
-            return true
+          // If children contain the same text, skip parent to avoid double-matching
+          if (el.children.length > 3) continue
+          const parent = el.closest('button, a') as HTMLElement | null
+          if (parent) {
+            parent.scrollIntoView({ block: 'center', inline: 'center' })
+            parent.click()
+            return { clicked: true, method: 'span-parent', text: t }
           }
+          // Click the element itself
+          el.scrollIntoView({ block: 'center', inline: 'center' })
+          el.click()
+          return { clicked: true, method: 'element-direct', text: t }
         }
-        return false
+
+        // Debug: enumerate all clickable elements for logging
+        const allBtnTexts = buttons.map(b => (b.innerText || '').trim().substring(0, 60))
+        const allAnchorTexts = anchors.map(a => (a.innerText || '').trim().substring(0, 60))
+        return { clicked: false, method: 'none', buttons: allBtnTexts, anchors: allAnchorTexts }
       }, re.source)
 
-      if (clicked) {
-        logDebug(logs, `[click] "Preparar y autorizar" clickeado (${where}).`)
+      if (clicked.clicked) {
+        logDebug(logs, `[click] "Preparar y autorizar" clickeado via ${clicked.method} (${where}): "${clicked.text}"`)
         return true
       }
+      logs.push(`[click][debug] "Preparar y autorizar" no encontrado en ${where}. Buttons: ${JSON.stringify(clicked.buttons)}, Anchors: ${JSON.stringify(clicked.anchors)}`)
       return false
-    } catch {
+    } catch (e) {
+      logDebug(logs, `[click] Error buscando en ${where}: ${e instanceof Error ? e.message : String(e)}`)
       return false
     }
   }
@@ -1001,14 +1021,15 @@ export async function enterOtpCode(otpCtx: OtpContext, logs: string[]) {
 
 /**
  * Consideramos el flujo "terminado" cuando Galicia muestra una confirmación de éxito
- * (comprobante / operación realizada / cheques emitidos).
+ * (comprobante / operación realizada / cheques emitidos / autorizaste la operacion).
+ * Returns { confirmed, bankOperationId } instead of just boolean.
  */
 export async function waitForBankSuccess(
   page: Page,
   logs: string[],
   timeoutMs: number,
   opts?: { requireOtpGone?: boolean }
-): Promise<boolean> {
+): Promise<{ confirmed: boolean; bankOperationId?: string }> {
   const start = Date.now()
   const hasSuccess = async (ctx: Page | Frame) => {
     try {
@@ -1021,7 +1042,14 @@ export async function waitForBankSuccess(
           t.includes("cheques emitidos") ||
           t.includes("comprobante") ||
           t.includes("número de operación") ||
-          t.includes("numero de operacion")
+          t.includes("numero de operacion") ||
+          // Transfer-specific success messages from Galicia
+          t.includes("autorizaste la operación") ||
+          t.includes("autorizaste la operacion") ||
+          t.includes("se está procesando") ||
+          t.includes("se esta procesando") ||
+          t.includes("identificador es") ||
+          t.includes("mostrar detalle")
         )
 
         if (!success) return false
@@ -1039,14 +1067,44 @@ export async function waitForBankSuccess(
     }
   }
 
+  // Extract bank operation ID from the success page
+  const extractBankId = async (ctx: Page | Frame): Promise<string | undefined> => {
+    try {
+      return await (ctx as any).evaluate(() => {
+        const t = document.body?.innerText || ""
+        // Match "El identificador es: LR2NBBy510" or similar
+        const match = t.match(/identificador\s+es[:\s]+([A-Za-z0-9]+)/i)
+        if (match) return match[1]
+        // Match "Número de operación: XXXXX"
+        const match2 = t.match(/n[uú]mero\s+de\s+operaci[oó]n[:\s]+([A-Za-z0-9]+)/i)
+        return match2 ? match2[1] : undefined
+      })
+    } catch { return undefined }
+  }
+
+  let lastLogTime = 0
   while (Date.now() - start < timeoutMs) {
-    if (await hasSuccess(page)) return true
+    if (await hasSuccess(page)) {
+      const bankId = await extractBankId(page)
+      logs.push(`[success] Confirmacion bancaria detectada en page.${bankId ? ` ID: ${bankId}` : ""}`)
+      return { confirmed: true, bankOperationId: bankId }
+    }
     for (const f of page.frames()) {
-      if (await hasSuccess(f)) return true
+      if (await hasSuccess(f)) {
+        const bankId = await extractBankId(f)
+        logs.push(`[success] Confirmacion bancaria detectada en frame.${bankId ? ` ID: ${bankId}` : ""}`)
+        return { confirmed: true, bankOperationId: bankId }
+      }
+    }
+    // Log progress every 15s so the stream doesn't go silent
+    const elapsed = Math.floor((Date.now() - start) / 1000)
+    if (elapsed - lastLogTime >= 15) {
+      lastLogTime = elapsed
+      logs.push(`[otp] Esperando confirmacion bancaria... (${elapsed}s)`)
     }
     await delay(750)
   }
-  return false
+  return { confirmed: false }
 }
 
 /**
@@ -1062,12 +1120,17 @@ export async function ejecutarEmisionCheques(
      * Defaults to true (safer).
      */
     manualOtp?: boolean
+    /** Optional callback invoked for every log line (enables real-time streaming). */
+    logCallback?: (line: string) => void
   }
 ): Promise<BatchAutomationResult> {
   const user = process.env.GALICIA_USER
   const pass = process.env.GALICIA_PASS
+  const logCb = options?.logCallback
 
   if (!user || !pass) {
+    const errMsg = "ERROR: Faltan credenciales GALICIA_USER / GALICIA_PASS en .env"
+    logCb?.(errMsg)
     return {
       results: checks.map((c) => ({
         checkId: c.id,
@@ -1076,11 +1139,23 @@ export async function ejecutarEmisionCheques(
       })),
       totalSent: 0,
       totalFailed: checks.length,
-      logs: ["ERROR: Faltan credenciales GALICIA_USER / GALICIA_PASS en .env"],
+      logs: [errMsg],
     }
   }
 
-  const logs: string[] = []
+  // Use a Proxy so every logs.push() also streams via logCallback
+  const _rawLogs: string[] = []
+  const logs: string[] = new Proxy(_rawLogs, {
+    get(target, prop, receiver) {
+      if (prop === "push") {
+        return (...args: string[]) => {
+          for (const msg of args) logCb?.(msg)
+          return Array.prototype.push.apply(target, args)
+        }
+      }
+      return Reflect.get(target, prop, receiver)
+    },
+  })
   const results: AutomationResult[] = []
   // Safer default: keep the window open so a human can type the OTP.
   // To enable fully automatic OTP, call ejecutarEmisionCheques(..., { manualOtp: false }).
@@ -1282,7 +1357,8 @@ export async function ejecutarEmisionCheques(
 	  // Esperar confirmación de éxito (más tiempo por defecto cuando el OTP es manual)
 	  const baseTimeout = Number(process.env.SUCCESS_DETECT_TIMEOUT_MS ?? 120000)
 	  const successTimeoutMs = otpEnv ? baseTimeout : Math.max(baseTimeout, 1800000) // min 30 min for manual OTP
-	  bankConfirmed = await waitForBankSuccess(page, logs, successTimeoutMs, { requireOtpGone: true })
+	  const successResult = await waitForBankSuccess(page, logs, successTimeoutMs, { requireOtpGone: true })
+	  bankConfirmed = successResult.confirmed
 
 	  // Manual OTP: never auto-close
 	  if (manualOtp || !otpEnv) {

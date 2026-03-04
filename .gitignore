@@ -1,94 +1,14 @@
-########################################
-# Node / Next
-########################################
+# v0 runtime files
+__v0_runtime_loader.js
+__v0_devtools.tsx
+__v0_jsx-dev-runtime.ts
+
+# Common ignores
 node_modules/
 .next/
-out/
-dist/
-build/
-coverage/
-*.tsbuildinfo
-
-########################################
-# Environment (credenciales)
-########################################
-.env
-.env.*
-!.env.example
-
-########################################
-# Logs
-########################################
-logs/
-*.log
-npm-debug.log*
-pnpm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
-########################################
-# OS
-########################################
+.env*.local
 .DS_Store
-Thumbs.db
-desktop.ini
-
-########################################
-# IDE
-########################################
-.vscode/*
-!.vscode/settings.json
-.idea/
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-
-########################################
-# Browser automation / sesiones
-########################################
-.chrome*
-Default/
-Cache/
-Code Cache/
-GPUCache/
-Crashpad/
-BrowserMetrics*
-playwright-report/
-test-results/
-*.har
-*.ldb
-*.pma
-*.journal
-LOCK
-
-########################################
-# Build artifacts / descargas
-########################################
-*.tgz
-*.zip
-*.7z
-*.rar
-*.exe
-*.msi
-*.bin
-*.apk
-*.deb
-*.rpm
-
-########################################
-# Archivos generados por scripts
-########################################
-my-project*
-npx
-next
-[0-9]*.[0-9]*.[0-9]*
-
-########################################
-# Datos locales
-########################################
+.env
 .data/
-tmp/
-temp/
-downloads/
-uploads/
+.chrome-galicia-cheques/
+.chrome-galicia-transferencias/

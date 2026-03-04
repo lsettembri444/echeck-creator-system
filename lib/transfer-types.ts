@@ -19,3 +19,21 @@ export interface TransferBatch {
   transfers: TransferEntry[]
   totalAmount: number
 }
+
+export interface TransferOperationLog {
+  id: string
+  batchId: string
+  batchDate: string
+  executedAt: string
+  totalSent: number
+  totalFailed: number
+  totalAmount: number
+  bankOperationId?: string
+  transfers: {
+    providerName: string
+    cbu: string
+    amount: number
+    success: boolean
+    error?: string
+  }[]
+}

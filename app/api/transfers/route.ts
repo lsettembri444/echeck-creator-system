@@ -13,11 +13,6 @@ function toISODateParts(year: number, month: number, day: number): string {
 }
 
 function normalizeDateToISO(input: unknown): string {
-  // Handle JS Date objects (XLSX may output Date instances)
-  if (input instanceof Date && !isNaN(input.getTime())) {
-    return toISODateParts(input.getUTCFullYear(), input.getUTCMonth() + 1, input.getUTCDate())
-  }
-
   if (input == null) return ""
 
   if (typeof input === "number" && !isNaN(input) && input > 30000) {
@@ -34,16 +29,9 @@ function normalizeDateToISO(input: unknown): string {
 
   let m = s.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{4})$/)
   if (m) {
-    // Ambiguity guard:
-    // - If the middle number is > 12, it's almost certainly MM/DD/YYYY (US-style)
-    //   e.g. 2/20/2026. In that case swap.
-    // - Otherwise treat as DD/MM/YYYY (AR-style)
-    const a = Number(m[1])
-    const b = Number(m[2])
+    const dd = Number(m[1])
+    const mm = Number(m[2])
     const yyyy = Number(m[3])
-    const isUS = b > 12 && a >= 1 && a <= 12
-    const dd = isUS ? b : a
-    const mm = isUS ? a : b
     return toISODateParts(yyyy, mm, dd)
   }
 

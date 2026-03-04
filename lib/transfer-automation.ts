@@ -22,62 +22,13 @@ const KEY_DELAY_MS = Number(process.env.ECHECK_KEY_DELAY_MS ?? (FAST_MODE ? 5 : 
 const POST_FIELD_DELAY_MS = Number(process.env.ECHECK_POST_FIELD_DELAY_MS ?? (FAST_MODE ? 150 : 800))
 const AFTER_FILLED_DELAY_MS = Number(process.env.ECHECK_AFTER_FILLED_DELAY_MS ?? (FAST_MODE ? 200 : 1500))
 
+// Module-level browser reference to reuse between batches
+// When manualOtp leaves the browser open, subsequent calls can reconnect
+let _sharedBrowser: Browser | null = null
+
 function logDebug(logs: string[], msg: string) {
   if (DEBUG_MODE) logs.push(msg)
 }
-
-function normalizeDateToISOYYYYMMDD(input: string): string {
-  const s = (input ?? "").toString().trim()
-  // DD/MM/YYYY or D/M/YYYY
-  let m = s.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{4})$/)
-  if (m) {
-    const dd = m[1].padStart(2, "0")
-    const mm = m[2].padStart(2, "0")
-    const yyyy = m[3]
-    return `${yyyy}-${mm}-${dd}`
-  }
-  // YYYY-MM-DD or YYYY/MM/DD
-  m = s.match(/^(\d{4})[\/.-](\d{1,2})[\/.-](\d{1,2})$/)
-  if (m) {
-    const yyyy = m[1]
-    const mm = m[2].padStart(2, "0")
-    const dd = m[3].padStart(2, "0")
-    return `${yyyy}-${mm}-${dd}`
-  }
-  return s
-}
-
-
-function normalizeMoney(raw: string): { dot: string; comma: string } {
-  // Accepts formats like "1.234,56" | "1234,56" | "1234.56" | "1,234.56" | "1234"
-  let s = (raw ?? "").toString().trim()
-  s = s.replace(/\s/g, "").replace(/[^\d.,-]/g, "")
-
-  const lastComma = s.lastIndexOf(",")
-  const lastDot = s.lastIndexOf(".")
-
-  if (lastComma !== -1 && lastDot !== -1) {
-    const decimalIsComma = lastComma > lastDot
-    if (decimalIsComma) {
-      // "1.234,56" -> "1234.56"
-      s = s.replace(/\./g, "").replace(",", ".")
-    } else {
-      // "1,234.56" -> "1234.56"
-      s = s.replace(/,/g, "")
-    }
-  } else if (lastComma !== -1) {
-    // "1234,56" -> "1234.56"
-    s = s.replace(",", ".")
-  } else {
-    // "1234.56" or "1234"
-  }
-
-  const dot = s
-  const comma = s.replace(".", ",")
-  return { dot, comma }
-}
-
-
 
 export interface TransferAutomationResult {
   success: boolean
@@ -90,7 +41,8 @@ export interface TransferBatchAutomationResult {
   totalSent: number
   totalFailed: number
   logs: string[]
-}
+  bankOperationId?: string
+  }
 
 /**
  * Navigate to Transferencias > Nueva transferencia
@@ -142,19 +94,29 @@ async function findTransferFormFrame(page: Page, logs: string[]): Promise<Frame 
   for (const frame of page.frames()) {
     try {
       const hasForm = await frame.evaluate(() => {
+        // Check for known input names from the bank's form
+        const knownNames = [
+          "new-transf-execution-date",
+          "new-transf-destination-account",
+          "new-transf-document",
+          "new-transf-amount",
+        ]
+        const hasKnownInput = knownNames.some((n) => document.querySelector(`input[name="${n}"]`))
+        if (hasKnownInput) return true
+        // Fallback: check for Spanish text
         const text = (document.body?.innerText || "").toLowerCase()
         const hasTransferText = text.includes("cuenta destino") || text.includes("transferencia")
         const inputs = Array.from(document.querySelectorAll("input"))
         const hasTransferInput = inputs.some((i) => {
           const n = (i.name || "").toLowerCase()
           const lt = (i.getAttribute("labeltext") || "").toLowerCase()
-          return n.includes("destino") || n.includes("cbu") || n.includes("monto") ||
+          return n.includes("destination") || n.includes("destino") || n.includes("monto") || n.includes("amount") ||
             lt.includes("destino") || lt.includes("cbu") || lt.includes("monto")
         })
         return hasTransferText || hasTransferInput
       })
       if (hasForm) {
-        logDebug(logs, `[iframe] Formulario de transferencia encontrado en frame: ${frame.url()}`)
+        logs.push(`[iframe] Formulario de transferencia encontrado en frame: ${frame.url()}`)
         return frame
       }
     } catch {
@@ -168,7 +130,7 @@ async function findTransferFormFrame(page: Page, logs: string[]): Promise<Frame 
     return text.includes("cuenta destino") || text.includes("nueva transferencia")
   })
   if (mainHasForm) {
-    logDebug(logs, "[iframe] Formulario de transferencia encontrado en main frame")
+    logs.push("[iframe] Formulario de transferencia encontrado en main frame")
     return page.mainFrame()
   }
 
@@ -177,209 +139,140 @@ async function findTransferFormFrame(page: Page, logs: string[]): Promise<Frame 
 }
 
 /**
- * Fill an input inside a specific frame by finding labels/text.
+ * Fill the Nth matching input in the frame (fallback for when fillByName fails).
+ * Searches by keywords in name/placeholder/labeltext attributes.
  */
-
-/**
- * Robustly set a text value in an input by locating a visible label/text and then the nearest input.
- * Works even when inputs lack stable name/id and avoids brittle nth-of-type selectors.
- */
-async function setInputByLabelText(
-  page: Page,
+async function fillNthInput(
   frame: Frame,
-  labelRe: RegExp,
+  keywords: string[],
   value: string,
+  nth: number,
   fieldName: string,
   logs: string[]
 ): Promise<boolean> {
-  logs.push(`Set "${fieldName}" por label: ${value}`)
-  const ok = await frame.evaluate((pattern: string, val: string) => {
-    const re = new RegExp(pattern, "i")
+  logs.push(`Llenando "${fieldName}" (nth=${nth}, keywords=[${keywords.join(",")}]) con: "${value}"`)
 
-    // Prefer scoping to the "Transferencia/s" card if present (reduces risk of hitting global search).
-    const roots: HTMLElement[] = []
-    const cardCandidates = Array.from(document.querySelectorAll("section, div")) as HTMLElement[]
-    for (const el of cardCandidates) {
-      const t = (el.innerText || "").toLowerCase()
-      if (t.includes("transferencia/s") || t.includes("transferencias")) {
-        roots.push(el)
-        break
-      }
-    }
-    if (roots.length === 0) roots.push(document.body as HTMLElement)
+  const found = await frame.evaluate(
+    (args: { kws: string[]; n: number }) => {
+      const { kws, n } = args
+      // Collect ALL visible inputs
+      const allInputs = Array.from(document.querySelectorAll("input")).filter(
+        (i) => i.type !== "hidden" && !i.disabled && i.offsetParent !== null
+      )
 
-    function findInRoot(root: HTMLElement): HTMLInputElement | null {
-      // 1) Real <label>
-      for (const label of Array.from(root.querySelectorAll("label"))) {
-        const txt = (label.textContent || "").trim()
-        if (re.test(txt)) {
-          const forAttr = (label as HTMLLabelElement).htmlFor
-          let inp: HTMLInputElement | null = null
-          if (forAttr) inp = document.getElementById(forAttr) as HTMLInputElement | null
-          if (!inp) inp = label.querySelector("input")
-          if (!inp) inp = label.closest("div")?.querySelector("input") as HTMLInputElement | null
-          if (!inp) inp = label.parentElement?.querySelector("input") as HTMLInputElement | null
-          if (inp) return inp
+      // Find all inputs matching any keyword by name/placeholder/labeltext
+      const matches: HTMLInputElement[] = []
+      for (const inp of allInputs) {
+        const nm = (inp.name || "").toLowerCase()
+        const lt = (inp.getAttribute("labeltext") || "").toLowerCase()
+        const ph = (inp.placeholder || "").toLowerCase()
+        for (const kw of kws) {
+          if (nm.includes(kw) || lt.includes(kw) || ph.includes(kw)) {
+            matches.push(inp)
+            break
+          }
         }
       }
 
-      // 2) Text nodes (span/div/p) that look like a field label
-      const textEls = Array.from(root.querySelectorAll("span, div, p")) as HTMLElement[]
-      for (const el of textEls) {
-        const txt = (el.innerText || "").trim()
-        if (!txt || txt.length > 40) continue
-        if (!re.test(txt)) continue
-
-        const container =
-          (el.closest("div") as HTMLElement | null) ||
-          (el.parentElement as HTMLElement | null)
-
-        if (!container) continue
-
-        // Try: same container input, or next sibling containers
-        let inp =
-          (container.querySelector("input") as HTMLInputElement | null) ||
-          (container.parentElement?.querySelector("input") as HTMLInputElement | null)
-
-        if (!inp) {
-          const sib = container.nextElementSibling as HTMLElement | null
-          inp = sib?.querySelector("input") as HTMLInputElement | null
-        }
-
-        if (inp) return inp
-      }
-
-      return null
-    }
-
-    let input: HTMLInputElement | null = null
-    for (const root of roots) {
-      input = findInRoot(root)
-      if (input) break
-    }
-    if (!input) return false
-
-    input.scrollIntoView({ block: "center" })
-    input.focus()
-    input.click()
-
-    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set
-    if (nativeSetter) nativeSetter.call(input, val)
-    else input.value = val
-
-    input.dispatchEvent(new Event("input", { bubbles: true }))
-    input.dispatchEvent(new Event("change", { bubbles: true }))
-    input.blur()
-    return true
-  }, labelRe.source, value)
-
-  // Some Galicia fields commit only on Tab
-  if (ok) {
-    await delay(120)
-    await page.keyboard.press("Tab").catch(() => {})
-    await delay(180)
-  } else {
-    logs.push(`[WARN] No se encontro input para "${fieldName}" por label`)
-  }
-
-  return ok
-}
-
-async function fillTransferField(
-  frame: Frame,
-  labelPattern: RegExp,
-  value: string,
-  fieldName: string,
-  logs: string[]
-) {
-  logs.push(`Llenando "${fieldName}" con: ${value}`)
-
-  const found = await frame.evaluate((pattern: string) => {
-    const re = new RegExp(pattern, "i")
-
-    // Search labels
-    const labels = Array.from(document.querySelectorAll("label"))
-    for (const label of labels) {
-      if (re.test(label.textContent?.trim() || "")) {
-        const forAttr = label.htmlFor
-        let input: HTMLInputElement | null = null
-        if (forAttr) input = document.getElementById(forAttr) as HTMLInputElement
-        if (!input) input = label.querySelector("input")
-        if (!input) input = label.closest("div")?.querySelector("input") || null
-        if (!input) input = label.parentElement?.querySelector("input") || null
-        if (input) {
-          input.focus()
-          input.click()
-          const nativeSetter = Object.getOwnPropertyDescriptor(
-            window.HTMLInputElement.prototype, "value"
-          )?.set
-          if (nativeSetter) nativeSetter.call(input, "")
-          else input.value = ""
-          input.dispatchEvent(new Event("input", { bubbles: true }))
-          input.dispatchEvent(new Event("change", { bubbles: true }))
-          return true
-        }
-      }
-    }
-
-    // Search spans/divs
-    const textEls = Array.from(document.querySelectorAll("span, div, p"))
-    for (const el of textEls) {
-      const text = (el as HTMLElement).innerText?.trim() || ""
-      if (re.test(text) && text.length < 50) {
-        const container = el.closest("div")
-        const input = container?.querySelector("input")
-        if (input) {
-          (input as HTMLInputElement).focus();
-          (input as HTMLInputElement).click()
-          const nativeSetter = Object.getOwnPropertyDescriptor(
-            window.HTMLInputElement.prototype, "value"
-          )?.set
-          if (nativeSetter) nativeSetter.call(input as HTMLInputElement, "")
-          else (input as HTMLInputElement).value = ""
-          input.dispatchEvent(new Event("input", { bubbles: true }))
-          input.dispatchEvent(new Event("change", { bubbles: true }))
-          return true
-        }
-      }
-    }
-
-    // Search by input name/labeltext directly
-    const inputs = Array.from(document.querySelectorAll("input"))
-    for (const inp of inputs) {
-      const n = (inp.name || "").toLowerCase()
-      const lt = (inp.getAttribute("labeltext") || "").toLowerCase()
-      const ph = (inp.placeholder || "").toLowerCase()
-      if (re.test(n) || re.test(lt) || re.test(ph)) {
-        inp.focus()
-        inp.click()
+      if (n < matches.length) {
+        const input = matches[n]
+        input.scrollIntoView({ block: "center" })
+        input.focus()
+        input.click()
+        // Clear via native setter
         const nativeSetter = Object.getOwnPropertyDescriptor(
-          window.HTMLInputElement.prototype, "value"
+          window.HTMLInputElement.prototype,
+          "value"
         )?.set
-        if (nativeSetter) nativeSetter.call(inp, "")
-        else inp.value = ""
-        inp.dispatchEvent(new Event("input", { bubbles: true }))
-        inp.dispatchEvent(new Event("change", { bubbles: true }))
-        return true
+        if (nativeSetter) nativeSetter.call(input, "")
+        else input.value = ""
+        input.dispatchEvent(new Event("input", { bubbles: true }))
+        input.dispatchEvent(new Event("change", { bubbles: true }))
+        return { ok: true, matchCount: matches.length }
       }
+
+      return { ok: false, matchCount: matches.length }
+    },
+    { kws: keywords, n: nth }
+  )
+
+  if (!found.ok) {
+    logs.push(
+      `[WARN] No se encontro "${fieldName}" nth=${nth} (total matches por keyword: ${found.matchCount}). Intentando por label/text...`
+    )
+    // Fallback: search by label text near the Nth matching container
+    const labelFallback = await frame.evaluate(
+      (args: { kws: string[]; n: number }) => {
+        const { kws, n } = args
+        let matchIdx = 0
+        // Search spans/divs that contain the keyword text, then find nearby inputs
+        const textEls = Array.from(document.querySelectorAll("span, div, p, label, th, td"))
+        for (const el of textEls) {
+          const text = ((el as HTMLElement).innerText || "").toLowerCase().trim()
+          if (text.length > 60) continue
+          for (const kw of kws) {
+            if (text.includes(kw)) {
+              const container = el.closest("div, td, th, fieldset, li")
+              const input = container?.querySelector("input:not([type=hidden]):not(:disabled)") as HTMLInputElement | null
+              if (input && input.offsetParent !== null) {
+                if (matchIdx === n) {
+                  input.scrollIntoView({ block: "center" })
+                  input.focus()
+                  input.click()
+                  const nativeSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype,
+                    "value"
+                  )?.set
+                  if (nativeSetter) nativeSetter.call(input, "")
+                  else input.value = ""
+                  input.dispatchEvent(new Event("input", { bubbles: true }))
+                  input.dispatchEvent(new Event("change", { bubbles: true }))
+                  return true
+                }
+                matchIdx++
+              }
+              break
+            }
+          }
+        }
+        return false
+      },
+      { kws: keywords, n: nth }
+    )
+
+    if (!labelFallback) {
+      logs.push(`[WARN] No se pudo llenar "${fieldName}" con ninguna estrategia.`)
+      return false
     }
-
-    return false
-  }, labelPattern.source)
-
-  if (!found) {
-    logs.push(`[WARN] No se encontro campo para "${fieldName}" (${labelPattern.source})`)
-    return
   }
 
-  await frame.page()!.keyboard.type(value, { delay: KEY_DELAY_MS })
+  // Type the value character by character into the focused element
+  // Note: frame.page() can return null; we get the page from the caller's context
+  const pageRef = frame.page()
+  if (!pageRef) {
+    logs.push(`[WARN] frame.page() returned null for "${fieldName}". Cannot type.`)
+    return false
+  }
+  await pageRef.keyboard.type(value, { delay: KEY_DELAY_MS })
   await delay(POST_FIELD_DELAY_MS)
+  return true
 }
+
+/** Known input name for the date field */
+const DATE_INPUT_NAME = "new-transf-execution-date"
 
 /**
- * Set the "Fecha de envio" field for a transfer.
- * Uses the EXACT same pattern as setDateOfPayment for checks:
- * find by placeholder*="fecha" first, then fallback to label search.
+ * Set the "Fecha de envio" field by interacting with the calendar popup.
+ *
+ * The bank's date picker is a React calendar widget. The input shows the selected
+ * date but ONLY accepts values by clicking a day in the calendar popup.
+ * All programmatic value changes (native setter, React fiber onChange, keyboard)
+ * are reverted when the calendar closes.
+ *
+ * Strategy:
+ *   1. Click the date input to open the calendar popup
+ *   2. Navigate to the correct month/year using the calendar arrows
+ *   3. Click the target day number button in the calendar grid
  */
 async function setTransferDate(
   page: Page,
@@ -387,487 +280,541 @@ async function setTransferDate(
   dateValueRaw: string,
   logs: string[]
 ): Promise<void> {
-  const ddmmyyyy = normalizeDateToDDMMYYYY(dateValueRaw)
-  const iso = normalizeDateToISOYYYYMMDD(dateValueRaw)
+  const dateValue = normalizeDateToDDMMYYYY(dateValueRaw)
+  logs.push(`Llenando "Fecha de envio" con: ${dateValue} (raw: "${dateValueRaw}")`)
 
-  // 1) Focus the input (same approach as cheques, with fallbacks)
-  const focused = await formFrame.evaluate(() => {
-    const byPh = document.querySelector('input[placeholder*="fecha" i]') as HTMLInputElement | null
-    if (byPh) {
-      byPh.scrollIntoView({ block: "center" })
-      byPh.focus()
-      byPh.click()
-      return { found: true as const, via: "placeholder", type: byPh.type || "" }
+  // Parse target date
+  const parts = dateValue.split("/")
+  const targetDay = parseInt(parts[0], 10)
+  const targetMonth = parseInt(parts[1], 10) // 1-based
+  const targetYear = parseInt(parts[2], 10)
+  logs.push(`[date] Target: dia=${targetDay}, mes=${targetMonth}, anio=${targetYear}`)
+
+  const selector = `input[name="${DATE_INPUT_NAME}"]`
+
+  // Read current value
+  const currentVal = await formFrame.evaluate((sel: string) => {
+    const input = document.querySelector(sel) as HTMLInputElement | null
+    if (!input) {
+      const fb = document.querySelector('input[placeholder*="echa" i]') as HTMLInputElement | null
+      if (fb) return { found: true, value: fb.value, name: fb.name }
+      return { found: false, value: "", name: "" }
     }
-
-    const byLt = document.querySelector('input[labeltext*="fecha" i]') as HTMLInputElement | null
-    if (byLt) {
-      byLt.scrollIntoView({ block: "center" })
-      byLt.focus()
-      byLt.click()
-      return { found: true as const, via: "labeltext", type: byLt.type || "" }
-    }
-
-    const byName = document.querySelector('input[name*="fecha" i]') as HTMLInputElement | null
-    if (byName) {
-      byName.scrollIntoView({ block: "center" })
-      byName.focus()
-      byName.click()
-      return { found: true as const, via: "name", type: byName.type || "" }
-    }
-
-    const byType = document.querySelector('input[type="date"]') as HTMLInputElement | null
-    if (byType) {
-      byType.scrollIntoView({ block: "center" })
-      byType.focus()
-      byType.click()
-      return { found: true as const, via: "type=date", type: byType.type || "" }
-    }
-
-    // Heuristic label search (last resort)
-    const labels = Array.from(document.querySelectorAll("label, span, div"))
-    for (const el of labels) {
-      const text = ((el as HTMLElement).innerText || (el as HTMLElement).textContent || "")
-        .trim()
-        .toLowerCase()
-      if (text.includes("fecha") && text.length < 80) {
-        const container = el.closest("div") || el.parentElement
-        const input = container?.querySelector("input") as HTMLInputElement | null
-        if (input) {
-          input.scrollIntoView({ block: "center" })
-          input.focus()
-          input.click()
-          return { found: true as const, via: "label-search", type: input.type || "" }
-        }
-      }
-    }
-
-    return { found: false as const, via: "", type: "" }
-  })
-
-  if (!focused.found) {
-    logs.push('[WARN] No se encontro el campo de fecha de envio en ningun selector')
-    const allInputs = await formFrame.evaluate(() => {
-      return Array.from(document.querySelectorAll("input")).map((i) => ({
-        name: i.name,
-        id: i.id,
-        type: i.type,
-        placeholder: i.placeholder,
-        labeltext: i.getAttribute("labeltext"),
-        value: i.value,
-      }))
-    })
-    logs.push(`[debug] Inputs encontrados: ${JSON.stringify(allInputs)}`)
-    return
-  }
-
-  const valueToSet = (focused.type || "").toLowerCase() === "date" ? iso : ddmmyyyy
-  logs.push(`Llenando "Fecha de envio" con: ${valueToSet} (type=${focused.type || "text"})`)
-  logDebug(logs, `[date] Campo de fecha encontrado via: ${focused.via}`)
-
-  // 2) Native setter + events (same as cheques)
-  const setOk = await formFrame.evaluate((val: string) => {
-    const active = document.activeElement as HTMLInputElement | null
-    const input =
-      active && active.tagName === "INPUT"
-        ? active
-        : ((document.querySelector('input[placeholder*="fecha" i]') as HTMLInputElement | null) ||
-            (document.querySelector('input[labeltext*="fecha" i]') as HTMLInputElement | null) ||
-            (document.querySelector('input[name*="fecha" i]') as HTMLInputElement | null) ||
-            (document.querySelector('input[type="date"]') as HTMLInputElement | null))
-
-    if (!input) return { ok: false, value: "" }
-
-    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set
-    if (nativeSetter) nativeSetter.call(input, val)
-    else input.value = val
-
-    input.dispatchEvent(new Event("input", { bubbles: true }))
-    input.dispatchEvent(new Event("change", { bubbles: true }))
-    input.blur()
-
-    return { ok: true, value: input.value }
-  }, valueToSet)
-
-  logDebug(logs, `[date] Setter ok=${setOk.ok}, value="${setOk.value}"`)
-
-  // 3) If setter didn't stick, fallback to typing + Enter (kept from cheques)
-  const expectedSep = (focused.type || "").toLowerCase() === "date" ? "-" : "/"
-  const looksOk = setOk.ok && (setOk.value?.includes(expectedSep) || setOk.value?.includes(valueToSet.slice(0, 4)))
-
-  if (!looksOk) {
-    await delay(150)
-    await page.keyboard.down("Control")
-    await page.keyboard.press("a")
-    await page.keyboard.up("Control")
-    await delay(150)
-    await page.keyboard.type(valueToSet, { delay: 60 })
-    await delay(250)
-    await page.keyboard.press("Enter").catch(() => {})
-    await delay(250)
-  }
-
-  // 4) Close any open datepicker popover (Galicia often renders it OUTSIDE the iframe)
-  await delay(150)
-  await page.keyboard.press("Escape").catch(() => {})
-  await delay(120)
-  await page.keyboard.press("Escape").catch(() => {})
-
-  // Click on the top document (not the iframe) to ensure the popover closes
-  await page
-    .evaluate(() => {
-      ;(document.activeElement as HTMLElement | null)?.blur?.()
-      ;(document.body as HTMLElement).click?.()
-    })
-    .catch(() => {})
-
-  // Extra safety: click on a neutral area (top-left) in case an overlay blocks body click
-  try {
-    await page.mouse.click(5, 5)
-  } catch {}
-
-  // Move focus away from the date input so the calendar doesn't reopen
-  await delay(150)
-  await page.keyboard.press("Tab").catch(() => {})
-  await delay(250)
-
-  // 5) Verify final
-  const finalVal = await formFrame.evaluate(() => {
-    const input =
-      (document.querySelector('input[placeholder*="fecha" i]') as HTMLInputElement | null) ||
-      (document.querySelector('input[labeltext*="fecha" i]') as HTMLInputElement | null) ||
-      (document.querySelector('input[name*="fecha" i]') as HTMLInputElement | null) ||
-      (document.querySelector('input[type="date"]') as HTMLInputElement | null)
-    return input?.value || ""
-  })
-  logs.push(`[date] Valor final de fecha: "${finalVal}"`)
-
-  // Close datepicker/popover reliably (it may be outside the iframe)
-  await delay(120)
-  await page.keyboard.press("Escape").catch(() => {})
-  await delay(80)
-  await page.keyboard.press("Escape").catch(() => {})
-  await delay(120)
-  await page.evaluate(() => (document.body as any)?.click?.())
-  await delay(120)
-  await page.mouse.click(5, 5).catch(() => {})
-  await delay(120)
-  await page.keyboard.press("Tab").catch(() => {})
-  await delay(160)
-}
-
-
-
-async function setTransferAmount(
-  page: Page,
-  formFrame: Frame,
-  amountRaw: string,
-  logs: string[]
-): Promise<void> {
-  const { dot, comma } = normalizeMoney(amountRaw)
-
-  // Helper: pick the "Monto" input inside the Transferencia/s card (avoid the global search box)
-  const pickInfo = await formFrame.evaluate(() => {
-    function textMatches(el: Element | null, needle: string) {
-      return !!el && (el.textContent || "").trim().toLowerCase() === needle.toLowerCase()
-    }
-
-    // 1) Scope to the Transferencia/s section/card if possible
-    const headers = Array.from(document.querySelectorAll("h1,h2,h3,h4,div,span"))
-    const transfersTitleEl = headers.find(el => (el.textContent || "").trim().toLowerCase() === "transferencia/s")
-    let scope: Element | Document = document
-    if (transfersTitleEl) {
-      scope = transfersTitleEl.closest("section,div,main,article") || document
-    }
-
-    // 2) Find the column label "Monto" inside scope (best anchor)
-    const labelCandidates = Array.from((scope as any).querySelectorAll?.("label,div,span,th") || []) as Element[]
-    const montoLabel = labelCandidates.find(el => (el.textContent || "").trim().toLowerCase() === "monto") || null
-    const labelRect = montoLabel ? (montoLabel as HTMLElement).getBoundingClientRect() : null
-
-    // 3) Collect inputs within scope (exclude hidden/disabled)
-    const inputs = Array.from((scope as any).querySelectorAll?.("input") || []) as HTMLInputElement[]
-    const visibles = inputs
-      .map((el, idx) => ({ el, idx }))
-      .filter(({ el }) => {
-        const r = el.getBoundingClientRect()
-        const style = window.getComputedStyle(el)
-        const visible = r.width > 20 && r.height > 18 && style.visibility !== "hidden" && style.display !== "none"
-        return visible && !el.disabled && el.type !== "hidden"
-      })
-
-    // 4) If we have labelRect, choose the input that's aligned under it
-    let bestIdx: number | null = null
-    if (labelRect) {
-      const labelCx = labelRect.left + labelRect.width / 2
-      let bestScore = Number.POSITIVE_INFINITY
-      for (const v of visibles) {
-        const r = v.el.getBoundingClientRect()
-        const cx = r.left + r.width / 2
-        // Prefer inputs below the label, and roughly aligned horizontally
-        const dy = Math.max(0, r.top - labelRect.bottom)
-        const dx = Math.abs(cx - labelCx)
-        const score = dy * 1.0 + dx * 0.5
-        if (dy >= 0 && dx < 250 && score < bestScore) {
-          bestScore = score
-          bestIdx = v.idx
-        }
-      }
-    }
-
-    // 5) Fallbacks: look for semantic attributes within scope
-    if (bestIdx === null) {
-      const semantic = visibles.find(v => {
-        const el = v.el
-        const s = [
-          el.name,
-          el.id,
-          el.getAttribute("aria-label"),
-          el.getAttribute("placeholder"),
-          el.getAttribute("inputmode"),
-        ]
-          .filter(Boolean)
-          .join(" ")
-          .toLowerCase()
-        return s.includes("monto") || s.includes("importe") || s.includes("amount")
-      })
-      if (semantic) bestIdx = semantic.idx
-    }
-
-    return {
-      found: bestIdx !== null,
-      bestIdx,
-      inScopeCount: inputs.length,
-      visibleCount: visibles.length,
-      hasMontoLabel: !!montoLabel,
-      scopeTag: (scope as any).tagName || "document",
-    }
-  })
-
-  logs.push(
-    `[monto] pick: found=${pickInfo.found} idx=${pickInfo.bestIdx} visibles=${pickInfo.visibleCount} hasLabel=${pickInfo.hasMontoLabel} scope=${pickInfo.scopeTag}`
-  )
-
-  if (!pickInfo.found || pickInfo.bestIdx == null) {
-    logs.push('[WARN] No se encontro el campo "Monto" dentro de Transferencia/s (evitando el buscador global)')
-    return
-  }
-
-  // Focus chosen input
-  await formFrame.evaluate((idx: number) => {
-    const input = Array.from(document.querySelectorAll("input"))[idx] as HTMLInputElement | undefined
-    if (!input) return
-    input.scrollIntoView({ block: "center" })
-    input.focus()
-    input.click()
-    input.select?.()
-  }, pickInfo.bestIdx)
-
-  // Try dot-decimal then comma-decimal
-  for (const val of [dot, comma]) {
-    logs.push(`[monto] Intentando setear: "${val}"`)
-
-    const res = await formFrame.evaluate(
-      (payload: { idx: number; val: string }) => {
-        const input = Array.from(document.querySelectorAll("input"))[payload.idx] as HTMLInputElement | undefined
-        if (!input) return { ok: false, value: "" }
-
-        input.focus()
-        input.select?.()
-
-        const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set
-        if (nativeSetter) nativeSetter.call(input, payload.val)
-        else input.value = payload.val
-
-        input.dispatchEvent(new Event("input", { bubbles: true }))
-        input.dispatchEvent(new Event("change", { bubbles: true }))
-        input.blur()
-
-        return { ok: true, value: input.value }
-      },
-      { idx: pickInfo.bestIdx, val }
-    )
-
-    logs.push(`[monto] value despues setter: "${res.value}"`)
-
-    // Commit (mask/formatter often needs a keystroke + blur/tab)
-    await delay(120)
-    await page.keyboard.press("Tab").catch(() => {})
-    await delay(150)
-
-    const finalVal = await formFrame.evaluate((idx: number) => {
-      const input = Array.from(document.querySelectorAll("input"))[idx] as HTMLInputElement | undefined
-      return input?.value || ""
-    }, pickInfo.bestIdx)
-
-    logs.push(`[monto] valor final: "${finalVal}"`)
-
-    if (/\d/.test(finalVal)) return
-  }
-
-  logs.push('[WARN] No logro setear "Monto" (posible mascara muy estricta o selector dentro de scope incorrecto)')
-}
-
-
-
-/**
- * Fill an input inside a specific frame by CSS selector (same approach as fillInFrame for checks).
- */
-async function fillTransferInFrame(
-  frame: Frame,
-  selector: string,
-  value: string,
-  fieldName: string,
-  logs: string[]
-) {
-  logs.push(`Llenando "${fieldName}" (${selector}) con: ${value}`)
-
-  const found = await frame.evaluate((sel: string) => {
-    const input = document.querySelector(sel) as HTMLInputElement
-    if (!input) return false
-    input.scrollIntoView({ block: "center" })
-    input.focus()
-    input.click()
-    // Use native setter to clear + trigger events
-    const nativeSetter = Object.getOwnPropertyDescriptor(
-      window.HTMLInputElement.prototype, "value"
-    )?.set
-    if (nativeSetter) {
-      nativeSetter.call(input, "")
-    } else {
-      input.value = ""
-    }
-    input.dispatchEvent(new Event("input", { bubbles: true }))
-    input.dispatchEvent(new Event("change", { bubbles: true }))
-    return true
+    return { found: true, value: input.value, name: input.name }
   }, selector)
 
-  if (!found) {
-    logs.push(`[WARN] No se encontro input "${fieldName}" con selector "${selector}"`)
+  if (!currentVal.found) {
+    logs.push("[WARN] No se encontro el campo de fecha de envio")
+    return
+  }
+  logs.push(`[date] Campo encontrado: value="${currentVal.value}"`)
+
+  if (currentVal.value === dateValue) {
+    logs.push(`[date] Fecha ya tiene el valor correcto: "${currentVal.value}"`)
+    return
+  }
+
+  // Step 1: Click the date input to open the calendar
+  await formFrame.evaluate((sel: string) => {
+    const input = document.querySelector(sel) as HTMLInputElement | null
+      ?? document.querySelector('input[placeholder*="echa" i]') as HTMLInputElement | null
+    if (input) {
+      input.scrollIntoView({ block: "center" })
+      input.click()
+    }
+  }, selector)
+  await delay(800)
+
+  // Step 2: Read current calendar month/year and navigate if needed
+  const MONTH_NAMES: Record<string, number> = {
+    enero: 1, febrero: 2, marzo: 3, abril: 4, mayo: 5, junio: 6,
+    julio: 7, agosto: 8, septiembre: 9, octubre: 10, noviembre: 11, diciembre: 12,
+    january: 1, february: 2, march: 3, april: 4, may: 5, june: 6,
+    july: 7, august: 8, september: 9, october: 10, november: 11, december: 12,
+  }
+
+  // Navigate the calendar to the target month
+  for (let navAttempt = 0; navAttempt < 24; navAttempt++) {
+    const calInfo = await formFrame.evaluate((monthMap: Record<string, number>) => {
+      // Find the calendar header -- look for text like "Febrero 2026"
+      // Search for elements containing month+year text near the date input
+      const candidates = Array.from(document.querySelectorAll("span, div, button, p, h2, h3, h4"))
+      for (const el of candidates) {
+        const text = ((el as HTMLElement).innerText || "").trim().toLowerCase()
+        // Match patterns like "febrero 2026" or "February 2026"
+        for (const [monthName, monthNum] of Object.entries(monthMap)) {
+          const regex = new RegExp(`${monthName}\\s+(\\d{4})`, "i")
+          const match = text.match(regex)
+          if (match) {
+            return { month: monthNum, year: parseInt(match[1], 10), headerText: text }
+          }
+        }
+      }
+      return null
+    }, MONTH_NAMES)
+
+    if (!calInfo) {
+      logs.push(`[date] No se pudo leer el mes/anio del calendario (intento ${navAttempt + 1})`)
+      if (navAttempt === 0) {
+        // Calendar might not be open, try clicking again
+        await formFrame.evaluate((sel: string) => {
+          const input = document.querySelector(sel) as HTMLInputElement | null
+            ?? document.querySelector('input[placeholder*="echa" i]') as HTMLInputElement | null
+          if (input) input.click()
+        }, selector)
+        await delay(800)
+        continue
+      }
+      break
+    }
+
+    logs.push(`[date] Calendario muestra: mes=${calInfo.month}, anio=${calInfo.year} (header: "${calInfo.headerText}")`)
+
+    const currentCalMonth = calInfo.year * 12 + calInfo.month
+    const targetCalMonth = targetYear * 12 + targetMonth
+
+    if (currentCalMonth === targetCalMonth) {
+      // We're on the right month -- click the day
+      logs.push(`[date] Mes correcto. Buscando dia ${targetDay}...`)
+      break
+    }
+
+    // Need to navigate: click next (>) or previous (<) arrow
+    const direction = targetCalMonth > currentCalMonth ? "next" : "prev"
+    const clicksNeeded = Math.abs(targetCalMonth - currentCalMonth)
+    logs.push(`[date] Navegando ${direction} ${clicksNeeded} mes(es)...`)
+
+    const clicked = await formFrame.evaluate((dir: string) => {
+      // Look for navigation arrows -- typically buttons with < or > or aria-label containing "next"/"previous"
+      const arrows = Array.from(document.querySelectorAll("button, [role='button'], span, a"))
+      for (const el of arrows) {
+        const text = ((el as HTMLElement).innerText || "").trim()
+        const ariaLabel = (el.getAttribute("aria-label") || "").toLowerCase()
+        const title = (el.getAttribute("title") || "").toLowerCase()
+
+        if (dir === "next") {
+          if (text === ">" || text === "\u203A" || text === "\u276F" || text === "\u25B6" ||
+              ariaLabel.includes("next") || ariaLabel.includes("siguiente") ||
+              title.includes("next") || title.includes("siguiente")) {
+            ;(el as HTMLElement).click()
+            return true
+          }
+        } else {
+          if (text === "<" || text === "\u2039" || text === "\u276E" || text === "\u25C0" ||
+              ariaLabel.includes("prev") || ariaLabel.includes("anterior") ||
+              title.includes("prev") || title.includes("anterior")) {
+            ;(el as HTMLElement).click()
+            return true
+          }
+        }
+      }
+
+      // Fallback: look for SVG icons inside buttons (common in React date pickers)
+      const btns = Array.from(document.querySelectorAll("button"))
+      // Usually the arrows are small buttons near the calendar header
+      // They often come in pairs; the first is "prev", the second is "next"
+      const arrowBtns = btns.filter((b) => {
+        const rect = b.getBoundingClientRect()
+        return rect.width > 0 && rect.width < 60 && rect.height > 0 && rect.height < 60 &&
+          (b.querySelector("svg") || b.innerText.length <= 2)
+      })
+      if (arrowBtns.length >= 2) {
+        const idx = dir === "prev" ? 0 : arrowBtns.length - 1
+        arrowBtns[idx].click()
+        return true
+      }
+
+      return false
+    }, direction)
+
+    if (!clicked) {
+      logs.push(`[date][WARN] No se encontro boton de navegacion "${direction}" en el calendario`)
+      break
+    }
+
+    await delay(500)
+  }
+
+  // Step 3: Click the target day number
+  await delay(300)
+  const dayClicked = await formFrame.evaluate((day: number) => {
+    // Find all day buttons/cells in the calendar
+    // Look for elements that contain EXACTLY the day number as text
+    const dayStr = String(day)
+    const candidates = Array.from(document.querySelectorAll("button, td, div[role='button'], span[role='button'], [role='gridcell']"))
+
+    // First pass: look for exact match buttons with the day text
+    for (const el of candidates) {
+      const text = ((el as HTMLElement).innerText || "").trim()
+      if (text === dayStr) {
+        // Make sure it's inside a calendar context (not some random button)
+        const parent = el.closest("[class*='calendar'], [class*='datepicker'], [class*='Calendar'], [class*='picker'], [role='grid'], [role='dialog']")
+          || el.closest("table")
+        if (parent) {
+          ;(el as HTMLElement).click()
+          return { clicked: true, method: "exact-in-calendar" }
+        }
+      }
+    }
+
+    // Second pass: look for <td> or buttons containing the day inside a table (calendar grid)
+    const tables = Array.from(document.querySelectorAll("table"))
+    for (const table of tables) {
+      // Check if this table has weekday headers (DOM, LUN, MAR...) - it's a calendar
+      const headerText = (table.querySelector("thead, tr:first-child")?.textContent || "").toLowerCase()
+      const isCalendar = /dom|lun|mar|mie|jue|vie|sab|sun|mon|tue|wed|thu|fri|sat/i.test(headerText)
+      if (!isCalendar) continue
+
+      const cells = Array.from(table.querySelectorAll("td, button"))
+      for (const cell of cells) {
+        const text = ((cell as HTMLElement).innerText || "").trim()
+        if (text === dayStr) {
+          ;(cell as HTMLElement).click()
+          return { clicked: true, method: "table-cell" }
+        }
+      }
+    }
+
+    // Third pass: any element with exact day text that's inside any popup/overlay
+    const popups = Array.from(document.querySelectorAll("[class*='popup'], [class*='overlay'], [class*='dropdown'], [class*='popover'], [class*='modal'], [class*='Popup'], [class*='Overlay'], [class*='Dropdown'], [class*='Popover']"))
+    for (const popup of popups) {
+      const els = Array.from(popup.querySelectorAll("button, td, div, span, a"))
+      for (const el of els) {
+        const text = ((el as HTMLElement).innerText || "").trim()
+        if (text === dayStr) {
+          ;(el as HTMLElement).click()
+          return { clicked: true, method: "popup-element" }
+        }
+      }
+    }
+
+    // Fourth pass: brute force -- find any clickable element with just the day number
+    // But only if it's visually positioned in the calendar area
+    const allEls = Array.from(document.querySelectorAll("button, td, [role='button'], [tabindex]"))
+    for (const el of allEls) {
+      const text = ((el as HTMLElement).innerText || "").trim()
+      const rect = (el as HTMLElement).getBoundingClientRect()
+      if (text === dayStr && rect.width > 0 && rect.width < 80 && rect.height > 0 && rect.height < 80) {
+        // Likely a calendar day cell
+        ;(el as HTMLElement).click()
+        return { clicked: true, method: "brute-force" }
+      }
+    }
+
+    return { clicked: false, method: "none" }
+  }, targetDay)
+
+  logs.push(`[date] Click dia ${targetDay}: clicked=${dayClicked.clicked}, method="${dayClicked.method}"`)
+  await delay(500)
+
+  // Verify the final value
+  const finalVal = await formFrame.evaluate((sel: string) => {
+    const input = document.querySelector(sel) as HTMLInputElement | null
+      ?? document.querySelector('input[placeholder*="echa" i]') as HTMLInputElement | null
+    return input?.value || ""
+  }, selector)
+  logs.push(`[date] Valor final de fecha: "${finalVal}" (esperado: "${dateValue}")`)
+
+  if (finalVal !== dateValue) {
+    logs.push(`[date][WARN] La fecha no coincide. Puede que el calendario no permita seleccionar esa fecha.`)
+  }
+
+  // Close popover if still open
+  await page.keyboard.press("Escape").catch(() => {})
+  await delay(200)
+}
+
+/**
+ * Known input names from the bank's form.
+ * These were discovered from production debugging.
+ */
+const KNOWN_INPUTS = {
+  date: "new-transf-execution-date",
+  destination: "new-transf-destination-account",
+  cuit: "new-transf-document",
+  description: "new-transf-description",
+  amount: "new-transf-amount",
+}
+
+/**
+ * Fill a known input field by its name attribute, targeting a specific row.
+ *
+ * The bank form is MULTI-ROW: "Agregar otra transferencia" adds a new row
+ * with the SAME name attributes. We use querySelectorAll and index by `rowIndex`
+ * to target the correct row (0 = first row, 1 = second row, etc.).
+ *
+ * Clears existing text via Ctrl+A + Backspace (React-safe),
+ * then keyboard.type() to enter the new value.
+ * Returns true if the field was found and filled.
+ */
+async function fillByName(
+  page: Page,
+  frame: Frame,
+  inputName: string,
+  value: string,
+  fieldLabel: string,
+  logs: string[],
+  rowIndex: number = 0
+): Promise<boolean> {
+  if (!value && value !== "0") {
+    logs.push(`[fill] "${fieldLabel}" (name=${inputName}, row=${rowIndex}): valor vacio, saltando.`)
     return false
   }
 
-  // Type the value character by character into the focused element
-  await frame.page()!.keyboard.type(value, { delay: KEY_DELAY_MS })
+  const found = await frame.evaluate(
+    (args: { name: string; row: number }) => {
+      const inputs = Array.from(document.querySelectorAll(`input[name="${args.name}"]`)) as HTMLInputElement[]
+      const input = inputs[args.row]
+      if (!input || !input.offsetParent) return { ok: false, disabled: false, currentValue: "", totalRows: inputs.length }
+      if (input.disabled) return { ok: false, disabled: true, currentValue: input.value, totalRows: inputs.length }
+
+      input.scrollIntoView({ block: "center" })
+      input.focus()
+      input.click()
+      return { ok: true, disabled: false, currentValue: input.value, totalRows: inputs.length }
+    },
+    { name: inputName, row: rowIndex }
+  )
+
+  if (!found.ok) {
+    if (found.disabled) {
+      logs.push(`[fill] "${fieldLabel}" (name=${inputName}, row=${rowIndex}/${found.totalRows}) esta deshabilitado, saltando.`)
+    } else {
+      logs.push(`[WARN] No se encontro "${fieldLabel}" (name=${inputName}, row=${rowIndex}/${found.totalRows}).`)
+      return false
+    }
+    return false
+  }
+
+  // Clear existing text using input.select() + Backspace
+  // We use frame.evaluate to select text WITHIN the specific input (not page-wide Ctrl+A
+  // which can affect other fields like the date picker)
+  await delay(100)
+
+  // Select all text within the focused input via DOM API
+  await frame.evaluate(
+    (args: { name: string; row: number }) => {
+      const inputs = Array.from(document.querySelectorAll(`input[name="${args.name}"]`)) as HTMLInputElement[]
+      const input = inputs[args.row]
+      if (input) {
+        input.focus()
+        input.select() // Select all text within THIS input only
+      }
+    },
+    { name: inputName, row: rowIndex }
+  )
+  await delay(50)
+  await page.keyboard.press("Backspace")
+  await delay(100)
+
+  // Verify cleared
+  const afterClear = await frame.evaluate(
+    (args: { name: string; row: number }) => {
+      const inputs = Array.from(document.querySelectorAll(`input[name="${args.name}"]`)) as HTMLInputElement[]
+      return inputs[args.row]?.value || ""
+    },
+    { name: inputName, row: rowIndex }
+  )
+
+  // If not cleared, try triple-click + Backspace as fallback
+  if (afterClear.length > 0) {
+    const allEls = await frame.$$(`input[name="${inputName}"]`)
+    const el = allEls[rowIndex]
+    if (el) {
+      await el.click({ clickCount: 3 })
+      await delay(50)
+    }
+    await page.keyboard.press("Backspace")
+    await delay(100)
+  }
+
+  // Type the value
+  const safeValue = String(value)
+  await page.keyboard.type(safeValue, { delay: KEY_DELAY_MS })
   await delay(POST_FIELD_DELAY_MS)
+
+  // Verify the value was set
+  const finalVal = await frame.evaluate(
+    (args: { name: string; row: number }) => {
+      const inputs = Array.from(document.querySelectorAll(`input[name="${args.name}"]`)) as HTMLInputElement[]
+      return inputs[args.row]?.value || ""
+    },
+    { name: inputName, row: rowIndex }
+  )
+
+  if (finalVal.includes(safeValue)) {
+    logs.push(`[fill] "${fieldLabel}" (row ${rowIndex}): "${safeValue}" OK (actual: "${finalVal}")`)
+  } else {
+    logs.push(`[fill][WARN] "${fieldLabel}" (row ${rowIndex}): esperado "${safeValue}", actual "${finalVal}"`)
+  }
   return true
 }
 
 /**
- * Find a CSS selector for an input by trying multiple strategies.
- */
-async function findInputSelector(
-  frame: Frame,
-  patterns: { name?: RegExp; labeltext?: RegExp; placeholder?: RegExp },
-  logs: string[]
-): Promise<string | null> {
-  return frame.evaluate((pats: { name?: string; labeltext?: string; placeholder?: string }) => {
-    const inputs = Array.from(document.querySelectorAll("input"))
-    for (const inp of inputs) {
-      const n = (inp.name || "").toLowerCase()
-      const lt = (inp.getAttribute("labeltext") || "").toLowerCase()
-      const ph = (inp.placeholder || "").toLowerCase()
-
-      let match = false
-      if (pats.name && new RegExp(pats.name, "i").test(n)) match = true
-      if (pats.labeltext && new RegExp(pats.labeltext, "i").test(lt)) match = true
-      if (pats.placeholder && new RegExp(pats.placeholder, "i").test(ph)) match = true
-
-      if (match) {
-        if (inp.name) return `input[name="${inp.name}"]`
-        if (inp.id) return `input#${inp.id}`
-        // Fallback: use index
-        const idx = inputs.indexOf(inp)
-        return `input:nth-of-type(${idx + 1})`
-      }
-    }
-    return null
-  }, {
-    name: patterns.name?.source,
-    labeltext: patterns.labeltext?.source,
-    placeholder: patterns.placeholder?.source,
-  })
-}
-
-/**
- * Fill a single transfer's data into the bank form
+ * Fill a single transfer's data into the bank form.
+ *
+ * The bank's form is MULTI-ROW: "Agregar otra transferencia" adds a new empty
+ * row below the existing one. All rows share the same `name` attributes.
+ * We use `rowIndex` to target the correct row (0-based).
+ *
+ * Date is NOT set here -- it is set ONCE per batch before any transfers are filled.
+ * The bank applies the same "Fecha de envio" to ALL transfers in a batch.
  */
 async function llenarTransferencia(
   page: Page,
   formFrame: Frame,
   transfer: TransferEntry,
   index: number,
+  rowIndex: number,
   logs: string[]
 ) {
-  logs.push(`--- Transferencia ${index + 1}: ${transfer.providerName} (CUIT: ${transfer.cuitNumber}, CBU: ${transfer.cbu}) ---`)
+  logs.push(
+    `--- Transferencia ${index + 1} (fila ${rowIndex}): ${transfer.providerName} ` +
+    `(CUIT: ${transfer.cuitNumber}, CBU: ${transfer.cbu}, ` +
+    `Monto: ${transfer.amount}) ---`
+  )
 
-  // Dump ALL input info for debugging (always, to help diagnose issues)
+  // Debug: dump all visible inputs
   const inputInfo = await formFrame.evaluate(() => {
-    return Array.from(document.querySelectorAll("input")).map((i, idx) => ({
-      idx,
-      name: i.name,
-      id: i.id,
-      type: i.type,
-      placeholder: i.placeholder,
-      labeltext: i.getAttribute("labeltext"),
-      value: i.value,
-      ariaLabel: i.getAttribute("aria-label"),
-    }))
+    return Array.from(document.querySelectorAll("input"))
+      .filter((i) => i.type !== "hidden")
+      .map((i, idx) => ({
+        idx,
+        name: i.name,
+        id: i.id,
+        type: i.type,
+        placeholder: i.placeholder,
+        labeltext: i.getAttribute("labeltext"),
+        value: i.value,
+        visible: i.offsetParent !== null,
+        disabled: i.disabled,
+      }))
   })
-  logs.push(`[debug] Inputs en formulario (${inputInfo.length}): ${JSON.stringify(inputInfo)}`)
+  logDebug(logs, `[debug] Inputs en formulario (transfer ${index + 1}): ${JSON.stringify(inputInfo)}`)
 
-  // a) Cuenta destino (CBU / Alias)
-// IMPORTANT: use label-based targeting to avoid typing into the global search box.
-const okDestino = await setInputByLabelText(page, formFrame, /cuenta\s*destino/i, transfer.cbu, "Cuenta destino / CBU", logs)
-if (!okDestino) {
-  // secondary attempt by keywords
-  await setInputByLabelText(page, formFrame, /destino|cbu|alias/i, transfer.cbu, "Cuenta destino / CBU", logs)
-}
+  // a) Cuenta destino (CBU/alias) -- fill FIRST so CBU lookup can resolve
+  await fillByName(page, formFrame, KNOWN_INPUTS.destination, transfer.cbu, "Cuenta destino / CBU", logs, rowIndex)
 
-// Wait for CBU to resolve (bank validates and may auto-fill CUIT/name)
-await delay(2000)
+  // Wait for CBU autocomplete to resolve (the bank looks up the CBU and auto-fills CUIT)
+  await delay(2000)
 
+  // b) CUIT/CUIL -- the bank MAY auto-fill from CBU lookup. Fill only if not disabled.
+  if (transfer.cuitNumber) {
+    await fillByName(page, formFrame, KNOWN_INPUTS.cuit, transfer.cuitNumber, "CUIT/CUIL", logs, rowIndex)
+  }
 
-  // b) Monto - completar con native setter + eventos (igual que cheques; soporta máscara)
-  await setTransferAmount(page, formFrame, transfer.amount.toString(), logs)
+  // c) Concepto -- select dropdown (react-select). Skip for now, defaults to "Varios".
 
-  // c) Fecha de envio = Fecha de Pago del Excel (do LAST to avoid datepicker covering other fields) de envio = Fecha de Pago del Excel (do LAST to avoid datepicker covering other fields)
-  await setTransferDate(page, formFrame, transfer.paymentDate, logs)
+  // d) Descripcion
+  if (transfer.providerName) {
+    await fillByName(page, formFrame, KNOWN_INPUTS.description, transfer.providerName, "Descripcion", logs, rowIndex)
+  }
+
+  // e) Monto
+  const montoStr = String(transfer.amount).replace(".", ",")
+  await fillByName(page, formFrame, KNOWN_INPUTS.amount, montoStr, "Monto", logs, rowIndex)
+
+  // Safety: close any remaining popovers
+  await page.keyboard.press("Escape").catch(() => {})
+  await delay(200)
+
+  // Verify: re-read values in THIS row after fill
+  const afterFill = await formFrame.evaluate((row: number) => {
+    // Collect value of each known field at the given row index
+    const names = [
+      "new-transf-destination-account",
+      "new-transf-document",
+      "new-transf-description",
+      "new-transf-amount",
+    ]
+    return names.map((name) => {
+      const inputs = Array.from(document.querySelectorAll(`input[name="${name}"]`)) as HTMLInputElement[]
+      const input = inputs[row]
+      return {
+        name,
+        row,
+        value: input?.value || "",
+        disabled: input?.disabled || false,
+      }
+    })
+  }, rowIndex)
+  logs.push(`[debug] Valores fila ${rowIndex} despues de llenar: ${JSON.stringify(afterFill)}`)
 
   await delay(AFTER_FILLED_DELAY_MS)
   await screenshot(page, `tf-07-transfer-${index + 1}-filled`, logs)
-  logs.push(`Transferencia ${index + 1} para ${transfer.providerName} completada.`)
+  logs.push(`Transferencia ${index + 1} (fila ${rowIndex}) para ${transfer.providerName} completada.`)
 }
 
 /**
- * Click "Agregar otra transferencia" button
+ * Click "Agregar otra transferencia" button.
+ * Uses Puppeteer's native click (real mouse events) instead of JS .click()
+ * because the bank's React app requires real DOM events to trigger its handlers.
  */
 async function clickAgregarOtraTransferencia(page: Page, formFrame: Frame, logs: string[]): Promise<boolean> {
-  // Try inside iframe first
+  // Try inside iframe first -- get the element's bounding box and use real click
   try {
-    const clicked = await formFrame.evaluate(() => {
+    const bbox = await formFrame.evaluate(() => {
       const re = /agregar\s+(otra\s+)?transferencia/i
-      const nodes = Array.from(document.querySelectorAll('button, [role="button"], a, span, div')) as HTMLElement[]
+      // Look for the clickable element
+      const nodes = Array.from(document.querySelectorAll('button, [role="button"], a, span, div, p')) as HTMLElement[]
       for (const n of nodes) {
         const txt = (n.innerText || '').trim()
         if (!re.test(txt) || txt.length > 80) continue
+        // Prefer the closest button/link ancestor
         const btn = n.closest('button, [role="button"], a') as HTMLElement | null
         const target = btn || n
-        ;(target as any).scrollIntoView?.({ block: 'center', inline: 'center' })
-        ;(target as any).click?.()
-        return true
+        target.scrollIntoView({ block: 'center', inline: 'center' })
+        const rect = target.getBoundingClientRect()
+        if (rect.width > 0 && rect.height > 0) {
+          return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, found: true }
+        }
       }
-      return false
+      return { x: 0, y: 0, found: false }
     })
-    if (clicked) {
-      logs.push('[click] Agregar otra transferencia (iframe)')
+
+    if (bbox.found) {
+      // Use Puppeteer's real mouse click at the element center
+      // For iframes, we need to offset by the iframe position
+      const frameElement = await formFrame.frameElement()
+      let offsetX = 0
+      let offsetY = 0
+      if (frameElement) {
+        const frameBox = await frameElement.boundingBox()
+        if (frameBox) {
+          offsetX = frameBox.x
+          offsetY = frameBox.y
+        }
+      }
+      await page.mouse.click(bbox.x + offsetX, bbox.y + offsetY)
+      logs.push('[click] Agregar otra transferencia (mouse click en iframe)')
+      await delay(500)
+
+      // Also try JS click as backup to ensure React picks it up
+      await formFrame.evaluate(() => {
+        const re = /agregar\s+(otra\s+)?transferencia/i
+        const nodes = Array.from(document.querySelectorAll('button, [role="button"], a, span, div, p')) as HTMLElement[]
+        for (const n of nodes) {
+          const txt = (n.innerText || '').trim()
+          if (!re.test(txt) || txt.length > 80) continue
+          const btn = n.closest('button, [role="button"], a') as HTMLElement | null
+          const target = btn || n
+          // Dispatch real mouse events
+          target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }))
+          target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }))
+          target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+          return
+        }
+      }).catch(() => {})
+
       return true
     }
   } catch { /* ignore */ }
 
-  // Fallback: main page
+  // Fallback: main page clickByText
   const clickedMain = await clickByText(page, /agregar\s+(otra\s+)?transferencia/i, null, logs)
-  if (clickedMain) logs.push('[click] Agregar otra transferencia (page)')
+  if (clickedMain) {
+    logs.push('[click] Agregar otra transferencia (page clickByText)')
+  }
   return clickedMain
 }
 
@@ -928,7 +875,7 @@ async function clickContinuarTransferencia(page: Page, formFrame: Frame, logs: s
       continue
     }
 
-    logDebug(logs, "[click] Intento de 'continuar' ejecutado")
+    logs.push("[click] Intento de 'continuar' ejecutado")
 
     // Wait for progress
     const progressed = await page
@@ -952,19 +899,58 @@ async function clickContinuarTransferencia(page: Page, formFrame: Frame, logs: s
 }
 
 /**
- * Main automation: login, navigate to transfers, fill all transfers, continue, authorize
+ * Creates a logs array that calls an optional callback on every push.
+ * This enables SSE streaming of logs in real-time.
+ */
+function createStreamingLogs(callback?: (line: string) => void): string[] {
+  const arr: string[] = []
+  return new Proxy(arr, {
+    get(target, prop, receiver) {
+      if (prop === "push") {
+        return (...args: string[]) => {
+          const result = Array.prototype.push.apply(target, args)
+          for (const line of args) {
+            callback?.(line)
+          }
+          return result
+        }
+      }
+      return Reflect.get(target, prop, receiver)
+    },
+  })
+}
+
+/**
+ * Main automation: login, navigate to transfers, set date ONCE, fill all transfers,
+ * continue, authorize.
+ *
+ * IMPORTANT: All transfers in a single call MUST share the same date.
+ * The bank applies "Fecha de envio" to the entire batch -- it does NOT support
+ * different dates per transfer line.
+ *
+ * The caller (API route) is responsible for grouping transfers by date and
+ * calling this function once per date group.
+ *
+ * @param transfers - All transfers for this batch (same date)
+ * @param batchDate - The shared date for all transfers (DD/MM/YYYY or raw format)
+ * @param options   - headless, manualOtp, logCallback
  */
 export async function ejecutarTransferencias(
   transfers: TransferEntry[],
+  batchDate: string,
   options?: {
     headless?: boolean
     manualOtp?: boolean
+    isLastBatch?: boolean
+    logCallback?: (line: string) => void
   }
 ): Promise<TransferBatchAutomationResult> {
   const user = process.env.GALICIA_USER
   const pass = process.env.GALICIA_PASS
 
   if (!user || !pass) {
+    const errMsg = "ERROR: Faltan credenciales GALICIA_USER / GALICIA_PASS en .env"
+    options?.logCallback?.(errMsg)
     return {
       results: transfers.map((t) => ({
         transferId: t.id,
@@ -973,47 +959,119 @@ export async function ejecutarTransferencias(
       })),
       totalSent: 0,
       totalFailed: transfers.length,
-      logs: ["ERROR: Faltan credenciales GALICIA_USER / GALICIA_PASS en .env"],
+      logs: [errMsg],
     }
   }
 
-  const logs: string[] = []
+  const normalizedDate = normalizeDateToDDMMYYYY(batchDate)
+  const logs = createStreamingLogs(options?.logCallback)
   const results: TransferAutomationResult[] = []
   const manualOtp = options?.manualOtp ?? true
   let browser: Browser | null = null
   let shouldCloseBrowser = true
+  let bankConfirmed = false
+  let bankOperationId: string | undefined
 
   try {
-    logs.push("Abriendo navegador...")
-    browser = await puppeteer.launch({
-      headless: false,
-      executablePath: chromePath(),
-      defaultViewport: VIEWPORT,
-      userDataDir: "./.chrome-galicia-transferencias",
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
-    })
-    const page = await browser.newPage()
+    logs.push(`=== Lote de transferencias: ${transfers.length} transferencias para fecha ${normalizedDate} ===`)
 
-    // Step 1: Login
-    await loginGalicia(page, user, pass, logs)
+    // Try to reuse existing browser (left open from previous batch with manual OTP)
+    let reusingBrowser = false
+    if (_sharedBrowser) {
+      try {
+        // Check if the shared browser is still alive
+        const pages = await _sharedBrowser.pages()
+        if (pages.length > 0) {
+          browser = _sharedBrowser
+          reusingBrowser = true
+          logs.push("Reutilizando navegador existente de lote anterior.")
+        }
+      } catch {
+        _sharedBrowser = null
+      }
+    }
+
+    if (!browser) {
+      logs.push("Abriendo navegador...")
+      browser = await puppeteer.launch({
+        headless: false,
+        executablePath: chromePath(),
+        defaultViewport: VIEWPORT,
+        userDataDir: "./.chrome-galicia-transferencias",
+        args: ["--no-sandbox", "--disable-setuid-sandbox"],
+      })
+    }
+
+    let page: Page
+    if (reusingBrowser) {
+      // Use the existing page (which should be on the bank's success page)
+      const pages = await browser.pages()
+      page = pages[pages.length - 1] || await browser.newPage()
+
+      // Try clicking "Nueva transferencia" button on the success page first
+      logs.push("Intentando click en 'Nueva transferencia' desde pantalla actual...")
+      const clickedNueva = await clickByText(page, /nueva transferencia/i, "Nueva transferencia", logs)
+      if (clickedNueva) {
+        logs.push("Click en 'Nueva transferencia' exitoso. Esperando formulario...")
+        await delay(5000)
+      } else {
+        // Fallback: navigate via URL
+        logs.push("No se encontro boton. Navegando via URL...")
+        await page.goto("https://empresas.bancogalicia.com.ar/transferencias/nueva-transferencia", {
+          waitUntil: "domcontentloaded",
+          timeout: 30000,
+        })
+        await delay(5000)
+      }
+    } else {
+      page = await browser.newPage()
+      // Step 1: Login (only needed for fresh browser)
+      await loginGalicia(page, user, pass, logs)
+    }
 
     // Step 2: Navigate to Transferencias > Nueva transferencia
-    await navegarNuevaTransferencia(page, logs)
+    // Skip if reusing browser -- we already navigated above
+    if (!reusingBrowser) {
+      await navegarNuevaTransferencia(page, logs)
+    }
 
     // Step 3: Find the form frame
     const formFrame = await findTransferFormFrame(page, logs)
     if (!formFrame) {
       const frameUrls = page.frames().map((f) => f.url())
-      logDebug(logs, `[debug] Frames disponibles: ${JSON.stringify(frameUrls)}`)
+      logs.push(`[debug] Frames disponibles: ${JSON.stringify(frameUrls)}`)
       throw new Error("No se encontro el formulario de transferencia en ningun iframe")
     }
 
-    // Step 4: Fill each transfer
+    // Step 4: Fill each transfer in its own row.
+    // NOTE: Date is set AFTER all transfers are filled (Step 5) because the bank's
+    // React app clears the date field when transfer rows are modified or added.
+    // Setting it last ensures it persists through to "Continuar".
+    //
+    // The bank form is MULTI-ROW: the first transfer uses row 0 (already visible).
+    // After filling row N, we click "Agregar otra transferencia" which adds row N+1.
+    // We then fill row N+1 for the next transfer.
+    //
+    // We count the destination inputs to track row count and wait for new rows.
+    let currentRowIndex = 0
+
     for (let i = 0; i < transfers.length; i++) {
       const transfer = transfers[i]
       try {
-        const currentFrame = (await findTransferFormFrame(page, logs)) || formFrame
-        await llenarTransferencia(page, currentFrame, transfer, i, logs)
+        // Re-find the form frame (iframe reference may have changed)
+        let currentFrame: Frame | null = null
+        for (let attempt = 0; attempt < 3; attempt++) {
+          currentFrame = await findTransferFormFrame(page, logs)
+          if (currentFrame) break
+          logs.push(`[retry] Reintentando encontrar frame de formulario (intento ${attempt + 2}/3)...`)
+          await delay(2000)
+        }
+        if (!currentFrame) {
+          throw new Error("No se encontro el formulario de transferencia despues de Agregar")
+        }
+
+        // Fill this transfer into the current row
+        await llenarTransferencia(page, currentFrame, transfer, i, currentRowIndex, logs)
 
         if (i < transfers.length - 1) {
           // More transfers to add: click "Agregar otra transferencia"
@@ -1023,20 +1081,48 @@ export async function ejecutarTransferencias(
             await screenshot(page, `tf-08-agregar-not-found-${i + 1}`, logs)
             throw new Error(`No se encontro boton 'Agregar otra transferencia' para transferencia ${i + 1}`)
           }
-          await delay(2500)
+
+          // Wait for the new row to appear by counting destination inputs
+          const expectedRowCount = currentRowIndex + 2 // current rows + 1 new
+          logs.push(`[agregar] Esperando nueva fila (esperando ${expectedRowCount} filas)...`)
+          let newRowAppeared = false
+          for (let waitAttempt = 0; waitAttempt < 10; waitAttempt++) {
+            await delay(1000)
+            const frame = await findTransferFormFrame(page, logs)
+            if (!frame) continue
+            const rowCount = await frame.evaluate((name: string) => {
+              return document.querySelectorAll(`input[name="${name}"]`).length
+            }, KNOWN_INPUTS.destination)
+            if (rowCount >= expectedRowCount) {
+              newRowAppeared = true
+              logs.push(`[agregar] Nueva fila detectada (${rowCount} filas) despues de ${waitAttempt + 1}s`)
+              break
+            }
+          }
+
+          if (!newRowAppeared) {
+            logs.push("[agregar][WARN] No se detecto nueva fila despues de 10s. Intentando llenar la siguiente de todos modos.")
+            await screenshot(page, `tf-08b-no-new-row-${i + 1}`, logs)
+          }
+
+          currentRowIndex++
           await screenshot(page, `tf-09-transfer-${i + 1}-added`, logs)
         }
 
         results.push({ transferId: transfer.id, success: true })
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err)
+        const stack = err instanceof Error ? err.stack : ""
         logs.push(`ERROR en transferencia ${transfer.providerName}: ${errorMsg}`)
+        if (stack) logs.push(`[stack] ${stack}`)
         results.push({ transferId: transfer.id, success: false, error: errorMsg })
-        await screenshot(page, `tf-error-transfer-${i + 1}`, logs)
+        await screenshot(page, `tf-error-transfer-${i + 1}`, logs).catch(() => {})
       }
     }
 
-    // Step 5: Click "Continuar" after all transfers
+    // Step 5: Set the batch date AFTER all transfers are filled
+    // The bank's React app clears the date when rows are added/modified,
+    // so we set it last to ensure it persists through to "Continuar".
     const okCount = results.filter((r) => r.success).length
     const failCount = results.filter((r) => !r.success).length
     if (okCount === 0) {
@@ -1048,8 +1134,34 @@ export async function ejecutarTransferencias(
       return { results, totalSent: okCount, totalFailed: failCount, logs }
     }
 
-    logs.push("Todas las transferencias agregadas. Click en 'Continuar'...")
-    const finalFrame = (await findTransferFormFrame(page, logs)) || formFrame
+    const dateFrame = (await findTransferFormFrame(page, logs)) || formFrame
+    logs.push(`[date] Seteando fecha del lote (despues de llenar filas): ${normalizedDate}`)
+    try {
+      await setTransferDate(page, dateFrame, normalizedDate, logs)
+    } catch (dateErr) {
+      const msg = dateErr instanceof Error ? dateErr.message : String(dateErr)
+      logs.push(`[date][ERROR] No se pudo setear la fecha: ${msg}`)
+      throw new Error(`No se pudo setear la fecha del lote (${normalizedDate}): ${msg}`)
+    }
+
+    // Verify date was actually set
+    const dateVerify = await dateFrame.evaluate((sel: string) => {
+      const input = document.querySelector(sel) as HTMLInputElement | null
+        ?? document.querySelector('input[placeholder*="echa" i]') as HTMLInputElement | null
+      return input?.value || ""
+    }, `input[name="${DATE_INPUT_NAME}"]`)
+
+    if (dateVerify !== normalizedDate) {
+      logs.push(`[date][WARN] Fecha verificada: "${dateVerify}" (esperado: "${normalizedDate}").`)
+    } else {
+      logs.push(`[date] Fecha verificada correctamente: "${dateVerify}"`)
+    }
+
+    await screenshot(page, "tf-10-date-set-before-continuar", logs)
+
+    // Step 6: Click "Continuar" now that all rows + date are filled
+    logs.push("Todas las transferencias y fecha seteadas. Click en 'Continuar'...")
+    const finalFrame = dateFrame
     const clickedContinuar = await clickContinuarTransferencia(page, finalFrame, logs)
 
     if (!clickedContinuar) {
@@ -1057,18 +1169,32 @@ export async function ejecutarTransferencias(
       logs.push("[WARN] No se logro hacer click efectivo en 'continuar'")
     }
 
-    let bankConfirmed = false
-
-    // Post-Continuar flow
+    // Post-Continuar flow: wait for the confirmation page to fully render
     await page.keyboard.press("Escape").catch(() => {})
-    await delay(600)
+    await delay(1500)
+    await screenshot(page, "tf-11-post-continuar", logs)
 
     // Accept T&C if present
     await acceptTermsIfPresent(page, logs)
 
-    // Click "Preparar y autorizar"
-    logs.push("Click en 'Preparar y autorizar'...")
-    await clickPrepareAndAuthorize(page, logs)
+    // Wait for the confirmation page to stabilize, then click "Preparar y autorizar"
+    // The button may take several seconds to become interactive after the page loads.
+    logs.push("Buscando boton 'Preparar y autorizar'...")
+    let prepararClicked = false
+    for (let attempt = 1; attempt <= 8; attempt++) {
+      prepararClicked = await clickPrepareAndAuthorize(page, logs)
+      if (prepararClicked) {
+        logs.push(`[click] "Preparar y autorizar" encontrado y clickeado (intento ${attempt}).`)
+        break
+      }
+      logs.push(`[retry] "Preparar y autorizar" no encontrado, reintentando (${attempt}/8)...`)
+      await delay(2000)
+    }
+
+    if (!prepararClicked) {
+      await screenshot(page, "tf-11b-preparar-not-found", logs)
+      logs.push("[WARN] No se logro clickear 'Preparar y autorizar' despues de 8 intentos.")
+    }
     await delay(700)
 
     // Wait for OTP screen
@@ -1089,13 +1215,24 @@ export async function ejecutarTransferencias(
 
       const baseTimeout = Number(process.env.SUCCESS_DETECT_TIMEOUT_MS ?? 120000)
       const successTimeoutMs = otpEnv ? baseTimeout : Math.max(baseTimeout, 1800000)
-      bankConfirmed = await waitForBankSuccess(page, logs, successTimeoutMs, { requireOtpGone: true })
+      const successResult = await waitForBankSuccess(page, logs, successTimeoutMs, { requireOtpGone: true })
+      bankConfirmed = successResult.confirmed
+      bankOperationId = successResult.bankOperationId
 
       if (manualOtp || !otpEnv) {
         shouldCloseBrowser = false
       }
 
-      logs.push(bankConfirmed ? "[done] Confirmacion de transferencia detectada." : "[done][WARN] No se detecto confirmacion de transferencia.")
+      if (bankConfirmed) {
+        logs.push(`[done] Confirmacion de transferencia detectada.${bankOperationId ? ` ID Banco: ${bankOperationId}` : ""}`)
+        // If this is the last batch, close the browser after success
+        if (options?.isLastBatch) {
+          shouldCloseBrowser = true
+          logs.push("[info] Ultimo lote -- el navegador se cerrara automaticamente.")
+        }
+      } else {
+        logs.push("[done][WARN] No se detecto confirmacion de transferencia.")
+      }
     } else {
       logs.push("[WARN] No se detecto pantalla de codigo (OTP).")
       if (manualOtp) shouldCloseBrowser = false
@@ -1115,8 +1252,8 @@ export async function ejecutarTransferencias(
     }
 
     logs.push(bankConfirmed
-      ? "Proceso finalizado: transferencias confirmadas por Galicia."
-      : "Proceso finalizado: sin confirmacion de transferencias (revisar en Galicia).")
+      ? `Proceso finalizado exitoso: ${okCount} transferencias confirmadas para fecha ${normalizedDate}.${bankOperationId ? ` ID Banco: ${bankOperationId}` : ""}`
+      : `Proceso finalizado: sin confirmacion de transferencias para fecha ${normalizedDate} (revisar en Galicia).`)
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err)
     logs.push(`ERROR general: ${errorMsg}`)
@@ -1128,9 +1265,12 @@ export async function ejecutarTransferencias(
   } finally {
     if (browser && shouldCloseBrowser) {
       await browser.close()
+      _sharedBrowser = null
       logs.push("Navegador cerrado.")
     } else if (browser) {
-      logs.push("Navegador queda abierto para OTP/verificacion manual.")
+      // Store reference so the next batch can reuse this browser
+      _sharedBrowser = browser
+      logs.push("Navegador queda abierto para el proximo lote.")
     }
   }
 
@@ -1139,5 +1279,6 @@ export async function ejecutarTransferencias(
     totalSent: results.filter((r) => r.success).length,
     totalFailed: results.filter((r) => !r.success).length,
     logs,
+    bankOperationId,
   }
 }

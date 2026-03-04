@@ -2,6 +2,7 @@
 
 import {
   FileSpreadsheet,
+  FileText,
   LayoutDashboard,
   History,
   Shield,
@@ -17,6 +18,7 @@ const navItems = [
   { label: "Historial Cheques", href: "/history", icon: History },
   { label: "Transferencias", href: "/transfers", icon: ArrowRightLeft },
   { label: "Historial Transf.", href: "/transfers/history", icon: History },
+  { label: "Facturas", href: "/invoices", icon: FileText },
 ]
 
 export function AppSidebar() {
